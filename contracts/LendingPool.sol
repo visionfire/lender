@@ -10,6 +10,7 @@ import "./InterestRateStrategy.sol";
 import "./AToken.sol";
 import "./VariableDebtToken.sol";
 import "./interfaces/IAggregatorV3.sol";
+import "./UserVault.sol";
 
 
 contract LendingPool is Ownable, ReentrancyGuard {
@@ -54,6 +55,12 @@ contract LendingPool is Ownable, ReentrancyGuard {
     mapping(address => ReserveData) public reserves;
     address[] public reserveList;
 
+    // 用户借贷资金托管账户合约
+    mapping(address => address) public userVaults;
+
+    // 允许的托管账户合约可执行地址
+    mapping(address => bool) public allowedTargets;
+
     // 提现请求记录
     mapping(address => mapping(address => WithdrawalRequest)) public userWithdrawRequests;
 
@@ -67,9 +74,13 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
     event ReserveInitialized(address indexed asset, address indexed aToken, address indexed variableDebtToken);
     event Supply(address indexed user, address indexed asset, uint256 amountRaw);
-    event Borrow(address indexed user, address indexed asset, uint256 amountRaw);
-    event Repay(address indexed user, address indexed asset, uint256 amountRaw);
+    event Borrow(address indexed user, address indexed asset, uint256 amountRaw, address vault);
+    event Repay(address indexed payer, address indexed asset, uint256 amountRaw);
     event LiquidationCall(address indexed collateralAsset, address indexed debtAsset, address indexed user, address liquidator, uint256 debtRepaidRaw, uint256 collateralSeizedRaw);
+    event Withdraw(address indexed user, address indexed asset, uint256 amountRaw, bool delayed, uint256 unlockTimestamp);
+    event ClaimWithdrawal(address indexed user, address indexed asset, uint256 amountRaw);
+    event VaultCreated(address indexed user, address vault);
+    event AllowedTargetSet(address indexed target, bool allowed);
 
 
 
@@ -150,7 +161,6 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
     // 借贷
     function borrow(address asset, uint256 amountRaw) external nonReentrant {
-        //
         require(reserves[asset].asset != address(0), "reserve not init");
         ReserveData storage r = reserves[asset];
 
@@ -165,26 +175,32 @@ contract LendingPool is Ownable, ReentrancyGuard {
         uint256 newDebtUSD = debtUSD + amountUSD;
         require(collUSD * r.liquidationThreshold / RAY >= newDebtUSD, "exceed HF");
 
+        // 判断池子资产是否足够
+        uint256 poolBal = IERC20(asset).balanceOf(address(this));
+        require(poolBal >= amountRaw, "exceed liquidity");
+
         // 增发债务token
         uint256 scaled = WadRayMath.rayDiv(amount18, r.variableBorrowIndex);
         VariableDebtToken(r.variableDebtToken).mintScaled(msg.sender, scaled);
         r.totalScaledVariableDebt += scaled;
 
-        // 转账资产
-        uint256 poolBal = IERC20(asset).balanceOf(address(this));
-        require(poolBal >= amountRaw, "exceed liquidity");
+        // 创建或获取用户托管账户合约
+        address vault = _createVaultIfNeeded(msg.sender);
+
+        // 更新池子流动性资产记录
         if (r.totalLiquidity >= amount18) {
             r.totalLiquidity -= amount18;
         } else {
             r.totalLiquidity = 0;
         }
 
-        IERC20(asset).transfer(msg.sender, amountRaw);
+        // 将借贷资金转入到托管账户合约
+        IERC20(asset).transfer(vault, amountRaw);
 
         // 更新计算利息
         _updateReserveRates(asset);
 
-        emit Borrow(msg.sender, asset, amountRaw);
+        emit Borrow(msg.sender, asset, amountRaw, vault);
     }
 
 
@@ -196,9 +212,29 @@ contract LendingPool is Ownable, ReentrancyGuard {
         // 更新资产索引,获取之前的利息
         _updateReserveState(asset);
 
-        // 转回资产还债
-        IERC20(asset).transferFrom(msg.sender, address(this), amountRaw);
-        uint256 amount18 = PoolUtils.to18(amountRaw, r.decimals);
+        uint256 remaining = amountRaw;
+        uint256 pulledFromVault = 0;
+
+        // 获取用户的托管账户合约
+        address vaultAddr = userVaults[msg.sender];
+        if (vaultAddr != address(0)) {
+            uint256 vaultBal = UserVault(vaultAddr).balanceOf(asset);
+            if (vaultBal > 0) {
+                uint256 take = vaultBal >= remaining ? remaining : vaultBal;
+                // 从托管账户合约转账还给流动性池
+                UserVault(vaultAddr).transferByPool(asset, address(this), take);
+                remaining -= take;
+                pulledFromVault = take;
+            }
+        }
+
+        // 如果托管账户合约不够还,则继续从用户个人地址还款
+        if (remaining > 0) {
+            IERC20(asset).transferFrom(msg.sender, address(this), remaining);
+        }
+
+        uint256 totalPaidRaw = amountRaw - remaining;
+        uint256 amount18 = PoolUtils.to18(totalPaidRaw, r.decimals);
         uint256 scaled = WadRayMath.rayDiv(amount18, r.variableBorrowIndex);
         if (scaled > r.totalScaledVariableDebt) {
             scaled = r.totalScaledVariableDebt;
@@ -207,21 +243,19 @@ contract LendingPool is Ownable, ReentrancyGuard {
         VariableDebtToken(r.variableDebtToken).burnScaled(msg.sender, scaled);
         if (r.totalScaledVariableDebt >= scaled) {
             r.totalScaledVariableDebt -= scaled;
-        }  else {
+        } else {
             r.totalScaledVariableDebt = 0;
         }
 
         r.totalLiquidity += amount18;
 
-        // 更新计算利息
         _updateReserveRates(asset);
-
-        emit Repay(msg.sender, asset, amountRaw);
+        emit Repay(msg.sender, asset, totalPaidRaw);
     }
 
 
     // 清算
-    function liquidationCall(address collateralAsset, address debtAsset, address user, uint256 debtToCoverRaw) external nonReentrant {
+    function liquidationCall(address collateralAsset, address debtAsset, address user, uint256 debtToCoverRaw, address[] calldata vaultTokensToSeize) external nonReentrant {
         require(reserves[collateralAsset].asset != address(0) && reserves[debtAsset].asset != address(0), "invalid assets");
         (uint256 collUSD, uint256 debtUSD, uint256 hf) = _getUserAccountData(user);
         require(hf < RAY, "user not liquidatable");
@@ -229,25 +263,40 @@ contract LendingPool is Ownable, ReentrancyGuard {
         ReserveData storage debtR = reserves[debtAsset];
         ReserveData storage collR = reserves[collateralAsset];
 
-        // 根据最大债务清算偿还比例计算最大清算还款量
         uint256 userDebtRaw = VariableDebtToken(debtR.variableDebtToken).balanceOf(user);
         uint256 maxRepay = (userDebtRaw * closeFactor) / 1e18;
-        if (debtToCoverRaw > maxRepay) {
-            debtToCoverRaw = maxRepay;
+        if (debtToCoverRaw > maxRepay) debtToCoverRaw = maxRepay;
+        require(debtToCoverRaw > 0, "nothing to repay");
+
+        uint256 remaining = debtToCoverRaw;
+        uint256 paidFromVault = 0;
+
+        // 1.先从用户的托管账户合约进行清算还款
+        address userVaultAddr = userVaults[user];
+        if (userVaultAddr != address(0)) {
+            uint256 vb = UserVault(userVaultAddr).balanceOf(debtAsset);
+            if (vb > 0) {
+                uint256 take = vb >= remaining ? remaining : vb;
+                UserVault(userVaultAddr).transferByPool(debtAsset, address(this), take);
+                remaining -= take;
+                paidFromVault = take;
+            }
         }
 
-        require(debtToCoverRaw > 0, "no repayment required");
+        // 2.不够再直接从清算者个人地址转款帮忙偿还
+        if (remaining > 0) {
+            IERC20(debtAsset).transferFrom(msg.sender, address(this), remaining);
+        }
 
-        // 先直接将清算人的资产转给pool用于帮借款用户还债
-        IERC20(debtAsset).transferFrom(msg.sender, address(this), debtToCoverRaw);
+        uint256 totalRepaid = debtToCoverRaw - remaining + ((remaining > 0) ? remaining : 0);
 
         // burn借款人用户的债务
         uint256 amount18 = PoolUtils.to18(debtToCoverRaw, debtR.decimals);
-        uint256 scaledDebt = WadRayMath.rayDiv(amount18, debtR.variableBorrowIndex);
-        VariableDebtToken(debtR.variableDebtToken).burnScaled(user, scaledDebt);
-        if (debtR.totalScaledVariableDebt >= scaledDebt) {
-            debtR.totalScaledVariableDebt -= scaledDebt;
-        }  else {
+        uint256 scaled = WadRayMath.rayDiv(amount18, debtR.variableBorrowIndex);
+        VariableDebtToken(debtR.variableDebtToken).burnScaled(user, scaled);
+        if (debtR.totalScaledVariableDebt >= scaled) {
+            debtR.totalScaledVariableDebt -= scaled;
+        } else {
             debtR.totalScaledVariableDebt = 0;
         }
 
@@ -256,24 +305,32 @@ contract LendingPool is Ownable, ReentrancyGuard {
         // 获取资产和抵押品价格,计算清算奖励
         uint256 priceDebt = _getAssetPrice(debtAsset);
         uint256 priceColl = _getAssetPrice(collateralAsset);
-        uint256 numerator = amount18 * priceDebt;
-        uint256 numeratorWithBonus = WadRayMath.rayMul(numerator, collR.liquidationBonus);
-        uint256 collAmount18 = numeratorWithBonus / priceColl;
+
+        // 需要先把偿还的债务换算为USD等价值来计算清算奖励,再将奖励的部分换成抵押物价值
+        uint256 amountUSD = (amount18 * priceDebt) / WAD;
+        uint256 amountUSDWithBonus = (amountUSD * collR.liquidationBonus) / RAY;
+        uint256 collAmount18 = (amountUSDWithBonus * WAD) / priceColl;
         uint256 collRaw = PoolUtils.from18(collAmount18, collR.decimals);
 
         // 判断借款人用户的凭证token
         uint256 userATokenRaw = AToken(collR.aToken).balanceOf(user);
-        if (userATokenRaw < collRaw) {
+        if (collRaw > userATokenRaw) {
             collRaw = userATokenRaw;
+            collAmount18 = PoolUtils.to18(collRaw, collR.decimals);
         }
 
         // burn借款人用户的抵押凭证
-        uint256 collAmount18ForBurn = PoolUtils.to18(collRaw, collR.decimals);
-        uint256 scaledToBurn = WadRayMath.rayDiv(collAmount18ForBurn, collR.liquidityIndex);
+        uint256 scaledToBurn = WadRayMath.rayDiv(collAmount18, collR.liquidityIndex);
         AToken(collR.aToken).burnScaled(user, scaledToBurn);
 
-        // 将奖励和抵押品转给清算人
+        // transfer underlying collateral from pool to liquidator
+        // 3.给奖励给到清算者
         IERC20(collateralAsset).transfer(msg.sender, collRaw);
+
+        // 如果vaultTokensToSeize有指定,则直接将用户里的指定的token都转给到池子
+        if (userVaultAddr != address(0) && vaultTokensToSeize.length > 0) {
+            UserVault(userVaultAddr).sweepTokens(vaultTokensToSeize, address(this));
+        }
 
         // 更新资产流动性索引和利率和债务流动性索引和利率
         _updateReserveState(collateralAsset);
@@ -285,18 +342,140 @@ contract LendingPool is Ownable, ReentrancyGuard {
     }
 
 
-    // 提现
+    // 申请提现
     function withdraw(address asset, uint256 amountRaw) external nonReentrant {
         ReserveData storage r = reserves[asset];
         require(r.asset != address(0), "reserve not init");
 
 
+        _updateReserveState(asset);
+
+        // 判断抵押凭证是否足够
+        uint256 userBal = AToken(r.aToken).balanceOf(msg.sender);
+        require(userBal >= amountRaw, "not enough aToken");
+
+        uint256 amount18 = PoolUtils.to18(amountRaw, r.decimals);
+        uint256 scaled = WadRayMath.rayDiv(amount18, r.liquidityIndex);
+
+        // 设置和提现时间锁
+        bool trigger = false;
+        uint256 totalLiquidity = r.totalLiquidity;
+
+        if (amount18 * 10 > totalLiquidity) trigger = true;
+        if (totalLiquidity > amount18) {
+            uint256 newAvailable = totalLiquidity - amount18;
+            if (newAvailable < (totalLiquidity * r.minLiquidityRatio / WAD)) trigger = true;
+        } else {
+            trigger = true;
+        }
+
+        uint256 totalBorrows = WadRayMath.rayMul(r.totalScaledVariableDebt, r.variableBorrowIndex);
+        (uint256 newLiqRate, uint256 newBorrowRate) = InterestRateStrategy(r.interestStrategy).calculateRates(
+            (totalLiquidity > amount18 ? totalLiquidity - amount18 : 0),
+            totalBorrows,
+            r.reserveFactor
+        );
+        if (newBorrowRate > r.currentVariableBorrowRate + (2 * 1e25)) {
+            trigger = true;
+        }
+
+        // burn抵押凭证
+        AToken(r.aToken).burnScaled(msg.sender, scaled);
+
+        // 提现需确保用户必须有托管账户合约
+        address vault = _createVaultIfNeeded(msg.sender);
+
+        if (trigger) {
+            // 延时提现,记录请求(资金仍在池里暂未转出)
+            WithdrawalRequest storage req = userWithdrawRequests[msg.sender][asset];
+            req.amount18 += amount18;
+            req.unlockTimestamp = block.timestamp + 7 days;
+            req.exists = true;
+
+            if (r.totalLiquidity >= amount18) {
+                r.totalLiquidity -= amount18;
+            } else {
+                r.totalLiquidity = 0;
+            }
+            _updateReserveRates(asset);
+            emit Withdraw(msg.sender, asset, amountRaw, true, req.unlockTimestamp);
+        } else {
+            // 立即提现,只能从托管账户合约提现到用户地址
+            uint256 need = amountRaw;
+
+            // 优先使用托管账户合约现有余额
+            uint256 vaultBal = UserVault(vault).balanceOf(asset);
+            if (vaultBal >= need) {
+                // 足够 -> 托管账户合约直接转给用户
+                UserVault(vault).transferByPool(asset, msg.sender, need);
+            } else {
+                // 不足 -> 先把托管账户合约里全部转给用户
+                if (vaultBal > 0) {
+                    UserVault(vault).transferByPool(asset, msg.sender, vaultBal);
+                }
+                uint256 remain = need - vaultBal;
+
+                // 剩余部分从池内转入托管账户合约，然后再从托管账户合约转给用户
+                uint256 poolBal = IERC20(asset).balanceOf(address(this));
+                require(poolBal >= remain, "withdraw: pool lacks funds");
+
+                IERC20(asset).transfer(vault, remain);
+                UserVault(vault).transferByPool(asset, msg.sender, remain);
+            }
+
+            if (r.totalLiquidity >= amount18) {
+                r.totalLiquidity -= amount18;
+            } else {
+                r.totalLiquidity = 0;
+            }
+            _updateReserveRates(asset);
+            emit Withdraw(msg.sender, asset, amountRaw, false, 0);
+        }
     }
 
-    // 申请提现
+
+
+    // 锁定时间后确认提现
     function claimWithdrawal(address asset) external nonReentrant {
+        WithdrawalRequest storage req = userWithdrawRequests[msg.sender][asset];
+        require(req.exists, "no request");
+        require(block.timestamp >= req.unlockTimestamp, "not unlocked");
+        uint256 amount18 = req.amount18;
+        require(amount18 > 0, "no amount");
 
+        uint256 raw = PoolUtils.from18(amount18, reserves[asset].decimals);
+
+        // 提现需确保用户必须有托管账户合约
+        address vault = _createVaultIfNeeded(msg.sender);
+
+        // 只能从托管账户合约提现,优先使用托管账户合约现有余额
+        uint256 vaultBal = UserVault(vault).balanceOf(asset);
+        if (vaultBal >= raw) {
+            UserVault(vault).transferByPool(asset, msg.sender, raw);
+        } else {
+            // 先把托管账户合约中的转给用户
+            if (vaultBal > 0) {
+                UserVault(vault).transferByPool(asset, msg.sender, vaultBal);
+            }
+            uint256 remain = raw - vaultBal;
+
+            // 剩余部分从池内转入托管账户合约，然后再从托管账户合约转给用户
+            uint256 poolBal = IERC20(asset).balanceOf(address(this));
+            require(poolBal >= remain, "pool lacks funds");
+
+            IERC20(asset).transfer(vault, remain);
+            UserVault(vault).transferByPool(asset, msg.sender, remain);
+        }
+
+        // 清空提现申请数据
+        req.amount18 = 0;
+        req.unlockTimestamp = 0;
+        req.exists = false;
+
+        emit ClaimWithdrawal(msg.sender, asset, raw);
     }
+
+
 
 
 
@@ -305,6 +484,15 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
 
     // ------------------------------------------- 可供查询的方法
+
+    function getUserVault(address user) external view returns (address) {
+        return userVaults[user];
+    }
+
+    // 查询地址是否允许托管账户合约交易
+    function isAllowedTarget(address target) external view returns (bool) {
+        return allowedTargets[target];
+    }
 
     // 获取当前抵押价值,债务价值,HF
     function getUserAccountData(address user) external view returns (uint256 totalCollateralUSD, uint256 totalDebtUSD, uint256 healthFactor) {
@@ -368,6 +556,11 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
     // ---------------------------------- 管理设置参数
 
+    function setAllowedTarget(address target, bool allowed) external onlyOwner {
+        allowedTargets[target] = allowed;
+        emit AllowedTargetSet(target, allowed);
+    }
+
     function setCloseFactor(uint256 wadVal) external onlyOwner {
         require(wadVal <= 1e18, "close factor > 1");
         closeFactor = wadVal;
@@ -387,6 +580,18 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
 
     // --------------------------------------------------- 内部方法
+
+    function _createVaultIfNeeded(address user) internal returns (address) {
+        address v = userVaults[user];
+        if (v == address(0)) {
+            // 创建托管账户合约
+            UserVault vault = new UserVault(user, address(this));
+            userVaults[user] = address(vault);
+            emit VaultCreated(user, address(vault));
+            return address(vault);
+        }
+        return v;
+    }
 
     function _updateReserveState(address asset) internal {
         ReserveData storage r = reserves[asset];

@@ -6,4 +6,6 @@ interface ILendingPool {
     function getReserveLiquidityIndex(address asset) external view returns (uint256);
 
     function getReserveVariableBorrowIndex(address asset) external view returns (uint256);
+
+    function isAllowedTarget(address target) external view returns (bool);
 }
