@@ -10,9 +10,10 @@
 3. [合约清单与职责说明](#合约清单与职责说明)
 4. [关键数据结构说明（ReserveData、WithdrawalRequest、UserVault）](#关键数据结构说明)
 5. [主要流程（supply / borrow / repay / withdraw / liquidation）与时序图](#主要流程与时序图)
-6. [合约API 参考（逐方法）](#合约api-参考逐方法)
-7. [事件与日志](#事件与日志)
-8. [附录：单位/定点数约定（WAD / RAY / 18-dec）](#附录单位定点数约定)
+6. [合约API参考](#合约API参考)
+7. [利率算法和流程](#利率算法和流程)
+8. [事件与日志](#事件与日志)
+9. [附录：单位/定点数约定（WAD / RAY / 18-dec）](#附录-单位定点数约定)
 
 ---
 
@@ -128,7 +129,7 @@
 
 ---
 
-## 主要流程与时序图（Mermaid）
+## 主要流程与时序图
 
 
 ### 1) Supply（用户抵押）
@@ -258,7 +259,7 @@ sequenceDiagram
 
 ---
 
-## 合约 API 参考（逐方法）
+## 合约API参考
 
 > 下面逐 contract 列出关键方法、输入输出、行为与注意点。为了可读性，省略了私有/内部只在文件中用到的 helper（详见源码）。
 
@@ -324,7 +325,38 @@ sequenceDiagram
 
 ---
 
-## 事件与日志（主要事件）
+## 利率算法和流程
+
+在此 LendingPool 合约中，采用基于 `InterestRateStrategy` 合约的可变利率机制。利率的计算涉及两个主要部分：抵押利率和债务利率。
+
+### 抵押利率计算
+抵押利率是指存入资金（资产）的回报率。它主要与池中的总流动性（即池中的资产总额）以及借款池中资产的需求有关。根据池中资产的借贷需求情况，利率会动态变化。具体计算公式如下：
+
+1. 总借款和总流动性：
+   - ` utilization = totalBorrows / (availableLiquidity + totalBorrows)` 计算借贷利用率。
+2. 基础利率（base rate）：
+- 当利用率较低时，抵押利率将比较低。
+- 利率计算如下：
+  - `variableBorrowRate = baseVariableBorrowRate + (utilization / optimalUtilizationRate) * slope1`
+- 当利用率较高时，利率将开始增加，超过一定利用率后进入坡度2阶段：
+  - `variableBorrowRate = baseVariableBorrowRate + slope1 + ((utilization - optimalUtilizationRate) / (1 - optimalUtilizationRate)) * slope2`
+3. 抵押利率（liquidityRate）：
+- 计算流动性回报：
+  - `liquidityRate = rayMul(rayMul(variableBorrowRate, utilization), oneMinusReserve)`
+- 这里的 `oneMinusReserve` 是为了考虑部分资金池资金用于担保等其他用途。该部分被称为“储备金（reserveFactor）”。
+
+### 债务利率计算
+债务利率是借款人借用资金时需要支付的利率。这个利率基于池中的借款总额和池中可用流动性的变化而变化。与抵押利率相似，债务利率也会随着借款池的需求和可用流动性的变化而变化。
+1. 借款利率计算：
+- 借款利率与 variableBorrowIndex 和 availableLiquidity、totalBorrows 的利用率挂钩，借款的成本随着池子流动性紧张而增高。
+2. 变量借款率（variableBorrowRate）：
+- 在 `InterestRateStrategy` 合约中，债务利率的计算基于相同的 `utilization`（借款使用率）值。
+- 当借款需求增加时，借款利率将上升。
+- 计算方式与上述的 **抵押利率** 类似，利用 `optimalUtilizationRate`、`slope1` 和 `slope2` 来调整借款利率。
+
+---
+
+## 事件与日志
 
 * `ReserveInitialized(asset, aToken, variableDebtToken)`
 * `Supply(user, asset, amountRaw)`
@@ -341,7 +373,7 @@ sequenceDiagram
 ---
 
 
-## 附录：单位 / 定点数约定（非常重要）
+## 附录-单位定点数约定
 
 * **WAD = 1e18**：用于以 18-dec 为基准的金额（USD 估值、内部 18-dec 归一化）。
 * **RAY = 1e27**：用于索引与利率（更高精度）。
