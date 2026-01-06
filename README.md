@@ -14,14 +14,17 @@
 7. [利率算法和流程](#利率算法和流程)
 8. [事件与日志](#事件与日志)
 9. [附录: 单位/定点数约定（WAD / RAY / 18-dec）](#附录-单位定点数约定)
-10. [附录: 抵押/借贷模拟案例](#附录-模拟案例)
+10. [附录: 抵押模拟案例](#附录-抵押模拟案例)
+11. [附录: 借贷模拟案例](#附录-借贷模拟案例)
 
 ---
 
 ## 概览
 
 本项目实现了一个 Aave-like 的借贷协议原型，并在其基础上引入了**用户托管合约（UserVault）**，满足如下目标：
-
+* **抵押**：允许用户操作 *EOA地址* (即用户自己掌握私钥的地址)或 *合约地址* (多签合约地址或其他智能合约地址)转入资产抵押
+  - *EOA地址*： 授权EOA地址对应资产权限给到LendingPool，调用LendingPool里面的supply方法进入存款抵押
+  - *合约地址*： 授权合约地址（操作者需要合约管理或签名权限）对应资产权限给到LendingPool，调用LendingPool里面的supply方法进入存款抵押
 * **超额借贷支持**：允许在风控约束下实现高杠杆（例如上限 10x），但通过托管合约与额外约束防止资金被直接套现；
 * **借款资金托管**：所有借贷出的底层资产统一转入 `UserVault`，不会直接发送到用户 EOA；
 * **Vault 内受限操作**：用户可通过 `UserVault.executeAdapter` 调用受信任的 adapter（或白名单合约）与 DEX 交互，但不能直接将 Vault 资金转走到任意外部地址；
@@ -139,7 +142,6 @@
 sequenceDiagram
   participant User as User(EOA)
   participant Pool as LendingPool
-  participant Vault as UserVault
   participant AToken as AToken
   participant ERC20 as ERC20(asset)
 
@@ -148,7 +150,6 @@ sequenceDiagram
   Pool->>ERC20: transferFrom(User, Pool, amount)
   Pool->>Pool: _updateReserveState(asset)
   Pool->>AToken: mintScaled(vault, scaledAmount)
-  Pool->>Vault: (if needed) createVault
   Pool->>ERC20: hold funds in pool liquidity
   Pool->>Pool: update totalLiquidity
   Pool-->>User: event Supply
@@ -382,8 +383,64 @@ sequenceDiagram
 
 ---
 
+## 附录-抵押模拟案例
 
-## 附录-模拟案例
+下面用一个具体、逐步、带公式与调用示例的模拟，完整说明“抵押资金”从用户发起到在系统内的流转：包括 ERC20 原始金额、Pool 内部的 18-dec 归一化、AToken 的 scaled 记账、利息如何通过 index 增长、以及后续提现/清算时各个合约之间的交互。
+
+> #### 假设与前提
+> + 资产：USDT（示例假设 decimals = 6）
+> + 用户：`UserA`（EOA）
+> + 初始 Pool 中该资产的 `liquidityIndex = RAY（1e27）`，`variableBorrowIndex = RAY`。
+> + WAD = 1e18，RAY = 1e27。
+> + 我们使用 `PoolUtils.to18(amountRaw, decimals)` 将 raw -> 18-dec internal units。
+
+#### 举例数值：UserA 抵押 `100 USDT`（即 raw = `100 * 10^6`）。
+
+
+## Step 0 — 用户准备（Approve）
+`UserA` 在钱包地址EOA中对 `Pool` 的 `supply` 授权：
+`IERC20(USDT).approve(address(pool), 100 * 10**6);`
+说明：必须先 `approve`，`Pool` 的 `supply` 会 `transferFrom` 用户。
+
+
+## Step 1 — 用户调用 supply（抵押进入 Pool）
+调用：
+`LendingPool.supply(USDT, 100 * 10**6);`
+发生的链上动作（顺序解释）：
+
+1. `Pool` 调用 `IERC20(USDT).transferFrom(UserA, address(pool), 100 * 10**6)` —— 将 `100 USDT` 转移到 `Pool` 合约地址。
+2. `Pool` 调用 `_updateReserveState(asset)` 更新 `index`
+3. 内部将 raw 转为 18-dec（统一内部单位）：
+  + `amount18 = PoolUtils.to18(100 * 10**6, 6) = 100 * 10**18`。
+4. 计算 scaled（用于 scaled accounting）：
+  + `scaled = WadRayMath.rayDiv(amount18, liquidityIndex)`
+  + 因为初始 `liquidityIndex = RAY`，所以 `scaled = amount18`（按公式 `a * RAY / RAY = a`）。
+5. 重要：`Pool` 将 `mintScaled(vault, scaled)` 给对应的抵押持有人。
+
+结果：
++ Pool 的 totalLiquidity 增加 100 * 1e18（内部 18-dec 单位）。
++ `用户地址EOA`现在**持有相当于 100 USDT 的 aToken 份额**（aToken.balanceOf(vault) = 100 USDT raw）。
+
+
+## Step 2 — aToken 与 scaled 会如何反映利息（index 变化）
+**核心概念**：aToken 的 `balanceOf(account)` 是基于该账户的 `_scaledBalances[account]` 与 reserve 的 `liquidityIndex` 计算得出：
+```solidity
+amount18 = rayMul(_scaledBalances[account], liquidityIndex)
+rawAmount = PoolUtils.from18(amount18, decimals)
+```
+因此，当 `liquidityIndex` 随时间增长（因为池中有人借款并产生利息，或系统调整利率），aToken 表示的 raw 余额会自动增加，体现利息收益。
+
+例如：
++ 初始 `scaled = 100 * 1e18`。若下一年后 `liquidityIndex` 增长 5%（`liquidityIndex_new = liquidityIndex * 1.05`），则：
++ `amount18 = scaled * liquidityIndex_new / RAY = 100 * 1e18 * 1.05 = 105 * 1e18`，
++ `raw = PoolUtils.from18(105 * 1e18, 6) = 105 USDT`。
+
+所以持有 aToken 的 `用户地址EOA` 在链上会看到 aToken.balanceOf(addr) 从 100 USDT -> 105 USDT（反映利息）。注意：底层真实的 ERC20 资产仍在 Pool 的合约地址或策略里，aToken 是对这些资产份额的索引/凭证。
+
+---
+
+
+## 附录-借贷模拟案例
 
 假设用户 `UserA` 抵押了 **100 USDT**，并决定借贷 **500 USDT**。以下是详细的资金流转步骤：
 
